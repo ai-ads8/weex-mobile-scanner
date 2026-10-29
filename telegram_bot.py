@@ -21,6 +21,8 @@ DB = os.getenv('DB_PATH', '/tmp/weex_moon.sqlite3')
 SCAN_INTERVAL = 30
 STATE = {'lastScan': 0, 'lastFetch': 0, 'error': 'Wachten op scanner', 'symbols': {}, 'setups': [], 'telegram': 'initialiseren'}
 LOCK = threading.RLock()
+LAST_HEALTH_ALERT = 0
+LAST_HEALTH_STATE = None
 SESSION = requests.Session()
 
 
@@ -45,7 +47,7 @@ def send(chat_id, message):
             raise RuntimeError(str(response.get('description', 'Telegram API fout')))
         return True
     except Exception as exc:
-        logging.warning('Telegram verzenden mislukt: %s', str(exc)[:180])
+        logging.warning('Telegram verzenden mislukt: %s', type(exc).__name__)
         return False
 
 
@@ -69,49 +71,82 @@ def scanner_read():
     return payload
 
 
-def format_signal(signal):
-    symbol = signal.get('symbol', '?')
-    direction = signal.get('side', '?')
-    mode = signal.get('mode', '?')
-    entry = signal.get('entry')
-    stop = signal.get('stop')
-    tp1 = signal.get('tp1')
-    volume = signal.get('volumeRatio')
-    return (f'WEEX MOON | PAPER SETUP\n{symbol} {direction} | {mode}\n'
-            f'Gesloten-candle entry: {entry}\nStop: {stop}\nTP1: {tp1}\n'
-            f'Volume: {volume}x\n'
-            'Experimenteel signaal, geen order. Controleer actuele WEEX-koers, mark price en risico.')
+def fmt(v):
+    try:return f'{float(v):.8f}'.rstrip('0').rstrip('.')
+    except (TypeError,ValueError):return '—'
 
+def format_signal(signal):
+    risk=signal.get('riskPct')
+    score=signal.get('score')
+    return (f"WEEX MOON | PAPER SETUP\n{signal.get('symbol','?')} {signal.get('side','?')} | {signal.get('mode','?')}\n"
+            f"Score: {score if score is not None else '—'}/100 | {signal.get('tier','SETUP')} (geen winstkans)\n"
+            f"Candle entry: {fmt(signal.get('entry'))}\nStop: {fmt(signal.get('stop'))}\n"
+            f"TP1: {fmt(signal.get('tp1'))}\nVolume: {fmt(signal.get('volumeRatio'))}x\n"
+            f"Stopafstand: {fmt(risk)}% | Trendbevestiging: {signal.get('alignment','—')}/3\n"
+            "LET OP: Hoge leverage kan liquidatie veroorzaken voor de technische stop. "
+            "Paper signaal, geen order. Controleer mark price, margin en risico.")
 
 def notify_new_signals(payload):
+    now=time.time()
     with connect() as db:
-        subscribers = [r['chat_id'] for r in db.execute('SELECT chat_id FROM subscribers WHERE alerts=1')]
-        for signal in payload.get('setups', []):
-            if not isinstance(signal, dict) or signal.get('status') not in ('PAPER_OPEN', 'OPEN', None):
-                continue
-            signal_id = str(signal.get('id') or '')
-            created = float(signal.get('createdAt') or 0)
-            if not signal_id or not created or time.time() - created > 600 or created - time.time() > 30:
-                continue
-            for chat_id in subscribers:
-                already = db.execute('SELECT 1 FROM delivered WHERE signal_id=? AND chat_id=?', (signal_id, chat_id)).fetchone()
-                if already:
-                    continue
-                if send(chat_id, format_signal(signal)):
-                    db.execute('INSERT OR IGNORE INTO delivered VALUES (?,?,?)', (signal_id, chat_id, time.time()))
-        db.execute('DELETE FROM delivered WHERE sent_at < ?', (time.time() - 14 * 86400,))
+        subscribers=[r['chat_id'] for r in db.execute('SELECT chat_id FROM subscribers WHERE alerts=1')]
+        candidates=[s for s in payload.get('setups',[]) if isinstance(s,dict)
+                    and s.get('status') in ('PAPER_OPEN','OPEN',None)
+                    and s.get('id') and 0<=now-float(s.get('createdAt') or 0)<=600]
+        # Group same-symbol/same-direction setups that arrive together into one alert.
+        groups={}
+        for s in candidates:
+            key=(s.get('symbol'),s.get('side'))
+            groups.setdefault(key,[]).append(s)
+        for (symbol,side),items in groups.items():
+            items.sort(key=lambda s:float(s.get('createdAt') or 0))
+            # Only group signals whose first detection is within a 5-minute window.
+            batches=[]
+            for s in items:
+                if not batches or float(s.get('createdAt') or 0)-float(batches[-1][0].get('createdAt') or 0)>300:
+                    batches.append([s])
+                else:batches[-1].append(s)
+            for batch in batches:
+                ids=[str(s['id']) for s in batch]
+                primary=max(batch,key=lambda s:(s.get('score') or 0))
+                message=format_signal(primary)
+                if len(batch)>1:
+                    modes=', '.join(sorted({str(s.get('mode','?')) for s in batch}))
+                    message+=f'\nBevestiging: {len(batch)} setups ({modes}); zelfde marktbeweging.'
+                for chat_id in subscribers:
+                    existing={r[0] for r in db.execute('SELECT signal_id FROM delivered WHERE chat_id=? AND signal_id IN ('+','.join('?' for _ in ids)+')',(chat_id,*ids))}
+                    if len(existing)==len(ids):continue
+                    if existing:
+                        fresh=[s for s in batch if str(s['id']) not in existing]
+                        message_to_send=format_signal(max(fresh,key=lambda s:(s.get('score') or 0)))
+                    else:message_to_send=message
+                    if send(chat_id,message_to_send):
+                        db.executemany('INSERT OR IGNORE INTO delivered VALUES (?,?,?)',[(i,chat_id,now) for i in ids])
+        db.execute('DELETE FROM delivered WHERE sent_at < ?',(now-14*86400,))
         db.commit()
 
 
 def scanner_loop():
+    global LAST_HEALTH_ALERT, LAST_HEALTH_STATE
     while True:
         try:
             payload = scanner_read()
+            if LAST_HEALTH_STATE is False:
+                with connect() as db:
+                    for r in db.execute('SELECT chat_id FROM subscribers WHERE alerts=1'):
+                        send(r['chat_id'],'WEEX Moon: scanner weer ACTUEEL. Nieuwe signalen worden weer gecontroleerd.')
+            LAST_HEALTH_STATE=True
             notify_new_signals(payload)
         except Exception as exc:
             with LOCK:
                 STATE['error'] = str(exc)[:240]
             logging.warning('Scanner fout: %s', str(exc)[:240])
+            if LAST_HEALTH_STATE is not False and time.time()-LAST_HEALTH_ALERT>900:
+                LAST_HEALTH_ALERT=time.time()
+                with connect() as db:
+                    for r in db.execute('SELECT chat_id FROM subscribers WHERE alerts=1'):
+                        send(r['chat_id'],'WEEX Moon waarschuwing: scanner NIET ACTUEEL. Geen signalen vertrouwen tot /status weer ACTUEEL is.')
+            LAST_HEALTH_STATE=False
         time.sleep(SCAN_INTERVAL)
 
 
@@ -227,4 +262,3 @@ def start_workers():
 start_workers()
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')), threaded=True)
-

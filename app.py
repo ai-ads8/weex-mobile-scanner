@@ -28,7 +28,7 @@ def load_seen():
         logging.exception("Could not restore signal deduplication")
         return set()
 
-seen = load_seen()
+seen = set()
 active = {}
 history = []
 DB_PATH=os.getenv("SCANNER_DB_PATH","/tmp/weex_moon_signals.sqlite3")
@@ -40,6 +40,8 @@ def db():
     c.execute("CREATE TABLE IF NOT EXISTS signal_history (id TEXT PRIMARY KEY, symbol TEXT, mode TEXT, side TEXT, candle_at INTEGER, created_at INTEGER, entry REAL, stop REAL, tp1 REAL, volume_ratio REAL, risk_pct REAL)")
     c.commit()
     return c
+
+seen = load_seen()
 
 def save_signal(signal):
     with db() as c:
@@ -339,4 +341,5 @@ $('search').addEventListener('input',()=>current&&render(current));$('filter').a
 threading.Thread(target=worker,daemon=True).start()
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")),threaded=True)
+
 

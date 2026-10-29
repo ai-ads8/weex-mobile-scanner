@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: weex-mobile-scanner
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/signals
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

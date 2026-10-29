@@ -7,6 +7,8 @@ import json
 import logging
 import sqlite3
 import threading
+import fcntl
+import re
 import requests
 from flask import Flask, jsonify
 
@@ -151,10 +153,18 @@ def process_message(message):
 
 
 def telegram_loop():
+    # Prevent duplicate polling workers on the same host.
+    lock_file = open("/tmp/weex_telegram_poll.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logging.error("Telegram polling already active in this instance")
+        return
     if not TOKEN:
         logging.error('TELEGRAM_BOT_TOKEN ontbreekt')
         return
     offset = None
+    consecutive_conflicts = 0
     while True:
         try:
             args = {'timeout': 20, 'allowed_updates': json.dumps(['message'])}
@@ -169,13 +179,24 @@ def telegram_loop():
                 offset = update['update_id'] + 1
                 if 'message' in update:
                     process_message(update['message'])
+            consecutive_conflicts = 0
             with LOCK:
                 STATE['telegram'] = 'polling actief'
         except Exception as exc:
+            # Never print Telegram API URLs: they contain the bot token.
+            status = getattr(getattr(exc, 'response', None), 'status_code', None)
+            is_conflict = status == 409
+            if is_conflict:
+                consecutive_conflicts += 1
+                reason = '409 Conflict: another bot poller is using this token'
+                delay = min(120, 10 * consecutive_conflicts)
+            else:
+                reason = f'Telegram polling error ({type(exc).__name__}, HTTP {status or "?"})'
+                delay = 5
             with LOCK:
-                STATE['telegram'] = 'polling fout: ' + str(exc)[:140]
-            logging.warning('Telegram polling fout: %s', str(exc)[:180])
-            time.sleep(5)
+                STATE['telegram'] = reason
+            logging.warning('%s; retry in %ss', reason, delay)
+            time.sleep(delay)
 
 
 @app.get('/')
@@ -206,3 +227,4 @@ def start_workers():
 start_workers()
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')), threaded=True)
+

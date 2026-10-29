@@ -1,7 +1,8 @@
-"""WEEX Moon scanner v4. REST polling, confirmed candles and separately labelled quotes."""
+"""WEEX Moon scanner v5.1. REST polling, confirmed candles and separately labelled quotes."""
 import os, time, math, threading, logging, requests, sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from flask import Flask, jsonify, Response
 
 app = Flask(__name__)
@@ -34,18 +35,73 @@ history = []
 DB_PATH=os.getenv("SCANNER_DB_PATH","/tmp/weex_moon_signals.sqlite3")
 MAX_SIGNAL_AGE_SEC=180
 MAX_QUOTE_AGE_SEC=45
+PAPER_MAX_AGE=24*3600
 
+@contextmanager
 def db():
     c=sqlite3.connect(DB_PATH,timeout=10)
     c.execute("CREATE TABLE IF NOT EXISTS signal_history (id TEXT PRIMARY KEY, symbol TEXT, mode TEXT, side TEXT, candle_at INTEGER, created_at INTEGER, entry REAL, stop REAL, tp1 REAL, volume_ratio REAL, risk_pct REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS paper_results (id TEXT PRIMARY KEY, symbol TEXT, side TEXT, mode TEXT, entry REAL, stop REAL, tp1 REAL, created_at INTEGER, status TEXT, resolved_at INTEGER, exit_price REAL, r_multiple REAL, score INTEGER)")
     c.commit()
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 seen = load_seen()
 
 def save_signal(signal):
     with db() as c:
         c.execute("INSERT OR IGNORE INTO signal_history VALUES (?,?,?,?,?,?,?,?,?,?,?)",(signal["id"],signal["symbol"],signal["mode"],signal["side"],signal["candleAt"],signal["createdAt"],signal["entry"],signal["stop"],signal["tp1"],signal["volumeRatio"],signal["riskPct"]))
+
+def score_signal(ratio, risk_pct, spread_pct, candle_age, quote_age, alignment=3):
+    # Heuristic quality indicator, NOT a probability of profit.
+    volume=min(25, max(0, (ratio-1)*12))
+    structure=25 if alignment==3 else 10
+    freshness=max(0, 20-candle_age/12-max(0,quote_age)/5)
+    execution=max(0, 15-(spread_pct or 0)*45)
+    risk=max(0, 15-abs(risk_pct-1.0)*6)
+    return max(0,min(100,round(volume+structure+freshness+execution+risk)))
+
+def paper_track(signals, rows, now):
+    # No lookahead: a signal can only resolve on a subsequent observed quote.
+    with db() as c:
+        for s in signals:
+            c.execute("INSERT OR IGNORE INTO paper_results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (s['id'],s['symbol'],s['side'],s['mode'],s['entry'],s['stop'],s['tp1'],s['createdAt'],'OPEN',None,None,None,s.get('score')))
+        open_rows=c.execute("SELECT id,symbol,side,entry,stop,tp1,created_at FROM paper_results WHERE status='OPEN'").fetchall()
+        for ident,symbol,side,entry,stop,tp,created in open_rows:
+            if created>=now:continue
+            q=(rows.get(symbol) or {}).get('quote') or {}
+            # Mark price is only a proxy for paper outcomes, not an executable fill.
+            mark=q.get('markPrice')
+            if not q.get('quoteFresh') or not isinstance(mark,(float,int)) or mark<=0:continue
+            # Never resolve on a quote observed before or at signal creation.
+            if float(q.get('quoteTimestamp') or 0)/1000 <= created:continue
+            hit_stop=mark<=stop if side=='LONG' else mark>=stop
+            hit_tp=mark>=tp if side=='LONG' else mark<=tp
+            expired=now-created>=PAPER_MAX_AGE
+            if not (hit_stop or hit_tp or expired):continue
+            result='SL' if hit_stop else 'TP1' if hit_tp else 'EXPIRED'
+            r=(mark-entry)/abs(entry-stop)*(1 if side=='LONG' else -1)
+            c.execute("UPDATE paper_results SET status=?,resolved_at=?,exit_price=?,r_multiple=? WHERE id=? AND status='OPEN'",
+                      (result,now,mark,round(r,3),ident))
+
+def paper_stats():
+    with db() as c:
+        rows=c.execute("SELECT status,COUNT(*),COALESCE(SUM(r_multiple),0) FROM paper_results GROUP BY status").fetchall()
+        recent=c.execute("SELECT id,symbol,side,mode,entry,stop,tp1,created_at,status,resolved_at,exit_price,r_multiple,score FROM paper_results ORDER BY created_at DESC LIMIT 80").fetchall()
+    d={status:count for status,count,_ in rows}
+    closed=d.get('TP1',0)+d.get('SL',0)
+    return ({'tracked':sum(d.values()),'open':d.get('OPEN',0),'tp1':d.get('TP1',0),'sl':d.get('SL',0),
+             'expired':d.get('EXPIRED',0),'closed':closed,
+             'winRate':round(100*d.get('TP1',0)/closed,1) if closed else None,
+             'netR':round(sum(v for status,_,v in rows if status in ('TP1','SL')),2)},
+            [dict(zip(('id','symbol','side','mode','entry','stop','tp1','createdAt','status','resolvedAt','exitPrice','rMultiple','score'),r)) for r in recent])
 
 def recent_history(limit=50):
     with db() as c:
@@ -150,14 +206,15 @@ def candidate(symbol,mode,data,info):
     fast,mid,slow,context=MODES[mode]
     a=data[fast]
     direction=info[mid]["trend"]
-    if direction!=info[slow]["trend"] or direction!=info[context]["trend"]:
+    aligned = sum(info[tf]["trend"] == direction for tf in (mid, slow, context))
+    if aligned < 2:
         return None
     p=a[-1]["c"]; prior=a[-21:-1]
     avg=sum(x["v"] for x in prior)/len(prior)
     ratio=a[-1]["v"]/avg if avg>0 else 0
     high=max(x["h"] for x in prior);low=min(x["l"] for x in prior)
     side="LONG" if direction=="UP" and p>high else "SHORT" if direction=="DOWN" and p<low else None
-    if not side or ratio<1.2:return None
+    if not side or ratio<1.1:return None
     # Only emit signals shortly after the actual triggering candle closes.
     candle_age=time.time()-(a[-1]["t"]/1000+TIMEFRAMES[fast])
     if candle_age<0 or candle_age>MAX_SIGNAL_AGE_SEC:return None
@@ -171,17 +228,19 @@ def candidate(symbol,mode,data,info):
     if not .001<=risk/p<=.045:return None
     if abs(q["lastPrice"]-p)/p>.008:return None
     if q["bidPrice"] is None or q["askPrice"] is None:return None
-    # Very wide stops are not actionable for highly leveraged positions.
-    if risk/p>.03:return None
     sign=1 if side=="LONG" else -1
+    score=score_signal(ratio,100*risk/p,q['spreadPct'],candle_age,q['quoteAgeSec'] or 0,alignment=aligned)
     return {"id":f"{symbol}:{mode}:{side}:{a[-1]['t']}",
             "symbol":symbol,"mode":mode,"side":side,"entry":p,"stop":stop,
             "tp1":p+sign*2*risk,"tp2":p+sign*3*risk,
-            "riskPct":round(100*risk/p,3),"volumeRatio":round(ratio,2),
+            "riskPct":round(100*risk/p,3),"volumeRatio":round(ratio,2),"score":score,
+            "scoreLabel":"Heuristische setupkwaliteit; geen winstkans",
+            "tier":"STRONG" if score>=80 else "GOOD" if score>=60 else "EARLY",
+            "alignment":aligned,
             "riskWarning":"Bij hoge leverage kan liquidatie ruim voor de technische stop plaatsvinden. Gebruik eigen positie- en margincontrole.",
             "maxLeverageNotRecommended":True,
             "createdAt":int(time.time()),"candleAt":a[-1]["t"],
-            "status":"PAPER_OPEN","reason":"Closed-candle breakout; 3 aligned higher timeframes; volume >=1.2x",
+            "status":"PAPER_OPEN","reason":f"Closed-candle breakout; {aligned}/3 trend alignment; volume >=1.1x",
             "source":"WEEX confirmed candles; entry is NOT executable last/mark quote",
             "quote":q}
 
@@ -234,6 +293,8 @@ def worker():
                         seen.add(s["id"]);active[s["id"]]=s
                         try:save_signal(s)
                         except Exception:logging.exception("Signal journal write failed")
+                try:paper_track(signals,rows,now)
+                except Exception:logging.exception("Paper tracker failed")
                 # Active setups expire after 15 minutes to avoid displaying stale entries.
                 active_copy=[s for s in active.values() if now-s["createdAt"]<900]
                 active.clear()
@@ -255,10 +316,21 @@ def status():
         result["symbols"]=dict(state["symbols"])
         result["setups"]=list(state["setups"])
         result["errors"]=list(state["errors"])
-    result["metrics"]={"closed":0,"winRate":None,"netR":0}
-    result["paper"]=[]
-    result["scannerVersion"]="v4"
+    try:result['metrics'],result['paper']=paper_stats()
+    except Exception:
+        logging.exception('Paper stats failed');result['metrics']={'error':'tracker unavailable'};result['paper']=[]
+    result['scannerVersion']='v5.1'
+    result['monitor']={'stale':not bool(result.get('lastScan') and time.time()-result['lastScan']<180),
+                       'marketsOK':sum(v.get('status')=='OK' for v in result['symbols'].values()),
+                       'lastSuccessfulScan':result.get('lastSuccessfulScan')}
     return jsonify(result)
+
+@app.get('/api/paper')
+def paper_results():
+    try:
+        metrics,results=paper_stats()
+        return jsonify({'metrics':metrics,'results':results,'method':'Observed mark-price crossings at scan times; not actual fills; intra-scan hits can be missed','persistence':'ephemeral without Render persistent disk'})
+    except Exception as e:return jsonify({'error':str(e)[:120]}),503
 
 @app.get("/api/history")
 def signal_history():
@@ -270,7 +342,7 @@ def health():
     with lock:
         age=time.time()-state["lastScan"] if state["lastScan"] else None
         ok=sum(1 for v in state["symbols"].values() if v.get("status")=="OK")
-    return jsonify({"version":"v4","scannerCurrent":bool(age is not None and 0<=age<180 and ok>0),"lastScanAgeSec":round(age,1) if age is not None else None,"marketsOK":ok,"telegramBridge":"separate service; verify with /test and /status"})
+    return jsonify({"version":"v5.1","scannerCurrent":bool(age is not None and 0<=age<180 and ok>0),"lastScanAgeSec":round(age,1) if age is not None else None,"marketsOK":ok,"telegramBridge":"separate service; verify with /test and /status"})
 
 @app.get("/api/quotes")
 def quotes():
@@ -282,7 +354,7 @@ def quotes():
 def home():
     return Response(r"""<!doctype html><html lang="nl"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WEEX Moon v4</title>
+<title>WEEX Moon v5.1</title>
 <style>
 :root{color-scheme:dark;--bg:#0b101c;--card:#19263a;--line:#30415b;--muted:#9caec6;--green:#6ee4b4;--red:#ff8d9d}
 *{box-sizing:border-box}body{background:radial-gradient(ellipse at top,#20314b,var(--bg) 50%);color:#f4f7ff;font:14px system-ui;margin:0}
@@ -309,7 +381,7 @@ table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}td,th{p
 footer{color:var(--muted);font-size:12px;line-height:1.7;margin-top:35px}
 @media(max-width:500px){.grid{grid-template-columns:1fr}.stat{padding:11px}.stat strong{font-size:21px}.brand{font-size:21px}}
 </style>
-<main><header><div class="brand">WEEX <em>MOON</em> v4</div><span class="pill" id="health">Verbinden...</span></header>
+<main><header><div class="brand">WEEX <em>MOON</em> v5.1</div><span class="pill" id="health">Verbinden...</span></header>
 <h1>Market intelligence</h1><p class="muted">Koersen, gevalideerde gesloten candles en paper-setups. Geen automatische orders. Alleen actuele, bevestigde signalen.</p>
 <div class="stats"><div class="stat"><small>MARKTEN OK</small><strong id="ok">—</strong></div><div class="stat"><small>SCAN LEEFTIJD</small><strong id="age">—</strong></div><div class="stat"><small>SETUPS</small><strong id="count">—</strong></div></div>
 <div class="tools"><input id="search" placeholder="Zoek BTC, QNT, INJ..."><select id="filter"><option value="all">Alle</option><option value="ok">OK</option><option value="issues">Problemen</option></select></div>
@@ -341,5 +413,3 @@ $('search').addEventListener('input',()=>current&&render(current));$('filter').a
 threading.Thread(target=worker,daemon=True).start()
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")),threaded=True)
-
-

@@ -409,7 +409,8 @@ $('signals').className=d.setups?.length?'grid':'empty';$('signals').innerHTML=d.
 async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);render(await r.json())}catch(e){$('health').textContent='● Verbinding mislukt';$('health').style.color='#ff8d9d'}}
 $('search').addEventListener('input',()=>current&&render(current));$('filter').addEventListener('change',()=>current&&render(current));refresh();setInterval(refresh,15000);
 </script></html>""",mimetype="text/html")
-
+from trade_analyzer import register_trade_analyzer
+register_trade_analyzer(app, state, lock, SYMBOLS)
 threading.Thread(target=worker,daemon=True).start()
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")),threaded=True)

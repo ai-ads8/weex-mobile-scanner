@@ -1,739 +1,272 @@
 
-"""WEEX Moon Telegram Bot v5.2.
-
-Telegram commands, automatic paper alerts, scanner monitoring,
-and recovery of stopped polling threads.
-
-This bot never places trading orders.
+"""WEEX Moon Telegram bridge — reads confirmed setups from the new scanner.
+No trading orders. Candle prices are not live mark prices.
 """
-
 import os
 import time
 import json
 import logging
 import sqlite3
 import threading
-import fcntl
-
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, abort
 
 logging.basicConfig(level=logging.INFO)
-
 app = Flask(__name__)
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API = f"https://api.telegram.org/bot{TOKEN}"
-
-SCANNER = os.getenv(
-    "SCANNER_URL",
-    "https://weex-moon-scanner-live.onrender.com/api/status",
-)
-
-DB = os.getenv("DB_PATH", "/tmp/weex_moon.sqlite3")
-
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+API = f'https://api.telegram.org/bot{TOKEN}'
+SCANNER = os.getenv('SCANNER_URL', 'https://weex-moon-scanner-live.onrender.com/api/status')
+DB = os.getenv('DB_PATH', '/tmp/weex_moon.sqlite3')
 SCAN_INTERVAL = 30
+STATE = {'lastScan': 0, 'lastFetch': 0, 'error': 'Wachten op scanner', 'symbols': {}, 'setups': [], 'telegram': 'initialiseren'}
 LOCK = threading.RLock()
-
-STATE = {
-    "lastScan": 0,
-    "lastFetch": 0,
-    "error": "Wachten op scanner",
-    "symbols": {},
-    "setups": [],
-    "telegram": "initialiseren",
-}
-
-POLL_HEARTBEAT = 0
-POLL_WORKER = None
-LAST_HEALTH_STATE = None
-LAST_HEALTH_ALERT = 0
-
-SCANNER_SESSION = requests.Session()
+SESSION = requests.Session()
+SEND_SESSION = requests.Session()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://weex-moon-bot-live.onrender.com").rstrip("/")
+WEBHOOK_SECRET = hashlib.sha256(("secret:" + TOKEN).encode()).hexdigest() if TOKEN else ""
+WEBHOOK_PATH = "/telegram/" + hashlib.sha256(("path:" + TOKEN).encode()).hexdigest()[:24] if TOKEN else "/telegram/not-configured"
+WEBHOOK_STATE = "initialiseren"
 POLL_SESSION = requests.Session()
 SEND_SESSION = requests.Session()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://weex-moon-bot-live.onrender.com").rstrip("/")
+WEBHOOK_SECRET = hashlib.sha256(("secret:" + TOKEN).encode()).hexdigest() if TOKEN else ""
+WEBHOOK_PATH = "/telegram/" + hashlib.sha256(("path:" + TOKEN).encode()).hexdigest()[:24] if TOKEN else "/telegram/not-configured"
+WEBHOOK_STATE = "initialiseren"
+SEND_SESSION = requests.Session()
+SEND_SESSION = requests.Session()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://weex-moon-bot-live.onrender.com").rstrip("/")
+WEBHOOK_SECRET = hashlib.sha256(("secret:" + TOKEN).encode()).hexdigest() if TOKEN else ""
+WEBHOOK_PATH = "/telegram/" + hashlib.sha256(("path:" + TOKEN).encode()).hexdigest()[:24] if TOKEN else "/telegram/not-configured"
+WEBHOOK_STATE = "initialiseren"
+POLL_HEARTBEAT = 0
+POLL_WORKER = None
 
 
 def connect():
-    conn = sqlite3.connect(DB, timeout=10)
+    conn = sqlite3.connect(DB, timeout=15)
     conn.row_factory = sqlite3.Row
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers (
-            chat_id INTEGER PRIMARY KEY,
-            alerts INTEGER NOT NULL DEFAULT 1
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS delivered (
-            signal_id TEXT NOT NULL,
-            chat_id INTEGER NOT NULL,
-            sent_at REAL NOT NULL,
-            PRIMARY KEY(signal_id, chat_id)
-        )
-    """)
-
+    conn.execute('CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY, alerts INTEGER NOT NULL DEFAULT 1)')
+    conn.execute('CREATE TABLE IF NOT EXISTS delivered (signal_id TEXT NOT NULL, chat_id INTEGER NOT NULL, sent_at REAL NOT NULL, PRIMARY KEY(signal_id,chat_id))')
     conn.commit()
     return conn
 
 
 def send(chat_id, message):
     if not TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN ontbreekt")
+        logging.warning('TELEGRAM_BOT_TOKEN ontbreekt')
         return False
-
-    message = str(message)
-
-    # Telegram allows up to 4096 characters per message.
-    chunks = []
-
-    while message:
-        if len(message) <= 3500:
-            chunks.append(message)
-            break
-
-        cut = message.rfind("\n\n", 0, 3500)
-
-        if cut < 500:
-            cut = 3500
-
-        chunks.append(message[:cut])
-        message = message[cut:].lstrip()
-
-    for chunk in chunks:
-        try:
-            response = SEND_SESSION.post(
-                API + "/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": chunk,
-                },
-                timeout=(5, 12),
-            )
-
-            response.raise_for_status()
-
-            if not response.json().get("ok"):
-                return False
-
-        except Exception as exc:
-            logging.warning(
-                "Telegram send failed: %s",
-                type(exc).__name__,
-            )
-            return False
-
-    return True
-
-
-def fmt(value):
     try:
-        return f"{float(value):.8f}".rstrip("0").rstrip(".")
-    except (TypeError, ValueError):
-        return "—"
-
-
-def format_signal(signal):
-    return (
-        "WEEX MOON | PAPER SETUP\n"
-        f"{signal.get('symbol', '?')} "
-        f"{signal.get('side', '?')} | "
-        f"{signal.get('mode', '?')}\n"
-        f"Score: {signal.get('score', '—')}/100 | "
-        f"{signal.get('tier', 'SETUP')} "
-        "(geen winstkans)\n"
-        f"Candle entry: {fmt(signal.get('entry'))}\n"
-        f"Stop: {fmt(signal.get('stop'))}\n"
-        f"TP1: {fmt(signal.get('tp1'))}\n"
-        f"Volume: {fmt(signal.get('volumeRatio'))}x\n"
-        f"Stopafstand: {fmt(signal.get('riskPct'))}% | "
-        f"Trendbevestiging: "
-        f"{signal.get('alignment', '—')}/3\n"
-        "LET OP: Hoge leverage kan liquidatie "
-        "veroorzaken voor de technische stop. "
-        "Paper signaal, geen order. "
-        "Controleer mark price, margin en risico."
-    )
-
-
-def subscriber_ids():
-    with connect() as db:
-        return [
-            row["chat_id"]
-            for row in db.execute(
-                "SELECT chat_id FROM subscribers WHERE alerts=1"
-            )
-        ]
+        message = str(message)[:3500]
+        r = SEND_SEND_SESSION.post(API + '/sendMessage', json={'chat_id': chat_id, 'text': message}, timeout=15)
+        r.raise_for_status()
+        response = r.json()
+        if not response.get('ok'):
+            raise RuntimeError(str(response.get('description', 'Telegram API fout')))
+        return True
+    except Exception as exc:
+        logging.warning('Telegram verzenden mislukt: %s', str(exc)[:180])
+        return False
 
 
 def scanner_read():
-    response = SCANNER_SESSION.get(
-        SCANNER,
-        timeout=(5, 15),
-        headers={"Cache-Control": "no-cache"},
-    )
-
+    response = SESSION.get(SCANNER, timeout=22, headers={'Cache-Control': 'no-cache'})
     response.raise_for_status()
     payload = response.json()
-
-    timestamp = float(payload.get("lastScan") or 0)
-
-    if not timestamp or not 0 <= time.time() - timestamp <= 180:
-        raise RuntimeError("Scannerdata niet actueel")
-
-    symbols = payload.get("symbols")
-    setups = payload.get("setups")
-
-    if not isinstance(symbols, dict):
-        raise RuntimeError("Ongeldige symbolen")
-
-    if not isinstance(setups, list):
-        raise RuntimeError("Ongeldige setups")
-
-    healthy = sum(
-        1
-        for item in symbols.values()
-        if isinstance(item, dict)
-        and item.get("status") == "OK"
-        and float(item.get("closed1mPrice") or 0) > 0
-    )
-
-    if healthy == 0:
-        raise RuntimeError("Geen gezonde markten")
-
+    timestamp = float(payload.get('lastScan') or 0)
+    if not timestamp or time.time() - timestamp > 180 or timestamp - time.time() > 30:
+        raise RuntimeError('Scanner niet actueel: laatste scan ouder dan 180 seconden')
+    symbols = payload.get('symbols')
+    setups = payload.get('setups')
+    if not isinstance(symbols, dict) or not isinstance(setups, list):
+        raise RuntimeError('Ongeldig formaat van de scanner')
+    healthy = {k: v for k, v in symbols.items() if isinstance(v, dict) and v.get('status') == 'OK' and float(v.get('closed1mPrice') or 0) > 0}
+    if not healthy:
+        errors = payload.get('errors', [])
+        raise RuntimeError('Geen bruikbare marktgegevens: ' + '; '.join(map(str, errors[:2])))
     with LOCK:
-        STATE.update(
-            lastScan=timestamp,
-            lastFetch=time.time(),
-            error=None,
-            symbols=symbols,
-            setups=setups,
-        )
-
+        STATE.update(lastScan=timestamp, lastFetch=time.time(), error=None, symbols=symbols, setups=setups)
     return payload
 
 
+def format_signal(signal):
+    symbol = signal.get('symbol', '?')
+    direction = signal.get('side', '?')
+    mode = signal.get('mode', '?')
+    entry = signal.get('entry')
+    stop = signal.get('stop')
+    tp1 = signal.get('tp1')
+    volume = signal.get('volumeRatio')
+    return (f'WEEX MOON | PAPER SETUP\n{symbol} {direction} | {mode}\n'
+            f'Gesloten-candle entry: {entry}\nStop: {stop}\nTP1: {tp1}\n'
+            f'Volume: {volume}x\n'
+            'Experimenteel signaal, geen order. Controleer actuele WEEX-koers, mark price en risico.')
+
+
 def notify_new_signals(payload):
-    now = time.time()
-
-    candidates = [
-        signal
-        for signal in payload.get("setups", [])
-        if isinstance(signal, dict)
-        and signal.get("id")
-        and signal.get("status") in (
-            "PAPER_OPEN",
-            "OPEN",
-            None,
-        )
-        and 0 <= now - float(
-            signal.get("createdAt") or 0
-        ) <= 600
-    ]
-
-    groups = {}
-
-    for signal in candidates:
-        key = (
-            signal.get("symbol"),
-            signal.get("side"),
-        )
-
-        groups.setdefault(key, []).append(signal)
-
-    for group in groups.values():
-        group.sort(
-            key=lambda s: float(
-                s.get("createdAt") or 0
-            )
-        )
-
-        batches = []
-
-        for signal in group:
-            created = float(
-                signal.get("createdAt") or 0
-            )
-
-            if (
-                not batches
-                or created - float(
-                    batches[-1][0].get("createdAt") or 0
-                ) > 300
-            ):
-                batches.append([signal])
-            else:
-                batches[-1].append(signal)
-
-        for batch in batches:
-            for chat_id in subscriber_ids():
-
-                ids = [
-                    str(signal["id"])
-                    for signal in batch
-                ]
-
-                with connect() as db:
-                    placeholders = ",".join(
-                        "?" for _ in ids
-                    )
-
-                    query = (
-                        "SELECT signal_id FROM delivered "
-                        "WHERE chat_id=? AND signal_id IN ("
-                        + placeholders + ")"
-                    )
-
-                    existing = {
-                        row["signal_id"]
-                        for row in db.execute(
-                            query,
-                            (chat_id, *ids),
-                        )
-                    }
-
-                fresh = [
-                    signal
-                    for signal in batch
-                    if str(signal["id"]) not in existing
-                ]
-
-                if not fresh:
-                    continue
-
-                best = max(
-                    fresh,
-                    key=lambda s: float(
-                        s.get("score") or 0
-                    ),
-                )
-
-                message = format_signal(best)
-
-                if len(fresh) > 1:
-                    message += (
-                        f"\nBevestiging: {len(fresh)} "
-                        "setups; zelfde marktbeweging."
-                    )
-
-                if send(chat_id, message):
-                    with connect() as db:
-                        db.executemany(
-                            "INSERT OR IGNORE INTO delivered "
-                            "VALUES (?,?,?)",
-                            [
-                                (
-                                    str(signal["id"]),
-                                    chat_id,
-                                    now,
-                                )
-                                for signal in fresh
-                            ],
-                        )
-
     with connect() as db:
-        db.execute(
-            "DELETE FROM delivered WHERE sent_at < ?",
-            (now - 14 * 86400,),
-        )
+        subscribers = [r['chat_id'] for r in db.execute('SELECT chat_id FROM subscribers WHERE alerts=1')]
+        for signal in payload.get('setups', []):
+            if not isinstance(signal, dict) or signal.get('status') not in ('PAPER_OPEN', 'OPEN', None):
+                continue
+            signal_id = str(signal.get('id') or '')
+            created = float(signal.get('createdAt') or 0)
+            if not signal_id or not created or time.time() - created > 600 or created - time.time() > 30:
+                continue
+            for chat_id in subscribers:
+                already = db.execute('SELECT 1 FROM delivered WHERE signal_id=? AND chat_id=?', (signal_id, chat_id)).fetchone()
+                if already:
+                    continue
+                if send(chat_id, format_signal(signal)):
+                    db.execute('INSERT OR IGNORE INTO delivered VALUES (?,?,?)', (signal_id, chat_id, time.time()))
+        db.execute('DELETE FROM delivered WHERE sent_at < ?', (time.time() - 14 * 86400,))
+        db.commit()
 
 
 def scanner_loop():
-    global LAST_HEALTH_STATE
-    global LAST_HEALTH_ALERT
-
     while True:
         try:
             payload = scanner_read()
-
-            if LAST_HEALTH_STATE is False:
-                for chat_id in subscriber_ids():
-                    send(
-                        chat_id,
-                        "WEEX Moon: scanner weer ACTUEEL.",
-                    )
-
-            LAST_HEALTH_STATE = True
-
             notify_new_signals(payload)
-
         except Exception as exc:
             with LOCK:
-                STATE["error"] = (
-                    f"{type(exc).__name__}: "
-                    f"{str(exc)[:130]}"
-                )
-
-            logging.warning(
-                "Scanner issue: %s",
-                type(exc).__name__,
-            )
-
-            if (
-                LAST_HEALTH_STATE is not False
-                and time.time() - LAST_HEALTH_ALERT > 900
-            ):
-                LAST_HEALTH_ALERT = time.time()
-
-                for chat_id in subscriber_ids():
-                    send(
-                        chat_id,
-                        "WEEX Moon waarschuwing: "
-                        "scanner NIET ACTUEEL. "
-                        "Vertrouw geen nieuwe setups.",
-                    )
-
-            LAST_HEALTH_STATE = False
-
+                STATE['error'] = str(exc)[:240]
+            logging.warning('Scanner fout: %s', str(exc)[:240])
         time.sleep(SCAN_INTERVAL)
 
 
 def process_message(message):
-    chat_id = message.get(
-        "chat", {}
-    ).get("id")
-
-    if not chat_id:
+    chat = message.get('chat', {}).get('id')
+    if not chat:
         return
-
-    command = (
-        (message.get("text") or "")
-        .strip()
-        .split(" ")[0]
-        .split("@")[0]
-        .lower()
-    )
-
-    if command == "/test":
-        send(
-            chat_id,
-            "WEEX Moon test OK. "
-            "Telegram reageert; dit zegt niets "
-            "over scannerdata.",
-        )
-
-    elif command == "/whoami":
-        send(chat_id, f"Chat-ID: {chat_id}")
-
-    elif command in (
-        "/start",
-        "/alerts_on",
-        "/alerts_off",
-    ):
-        enabled = int(command != "/alerts_off")
-
+    command = (message.get('text') or '').strip().split(' ')[0].split('@')[0].lower()
+    if command == '/start':
         with connect() as db:
-            db.execute(
-                "INSERT INTO subscribers(chat_id,alerts) "
-                "VALUES (?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE "
-                "SET alerts=excluded.alerts",
-                (chat_id, enabled),
-            )
-
-        send(
-            chat_id,
-            "WEEX Moon verbonden. Meldingen "
-            + ("AAN" if enabled else "UIT")
-            + ".\n/status /scan /test "
-            "/alerts_on /alerts_off /whoami",
-        )
-
-    elif command == "/status":
+            db.execute('INSERT INTO subscribers(chat_id,alerts) VALUES (?,1) ON CONFLICT(chat_id) DO UPDATE SET alerts=1', (chat,))
+        send(chat, 'WEEX Moon verbonden. Meldingen ingeschakeld.\n/status — scannerstatus\n/scan — recente setups\n/alerts_on — meldingen aan\n/alerts_off — meldingen uit\n/test — test Telegram-bericht\n/whoami — chat-ID')
+    elif command == '/whoami':
+        send(chat, f'Chat-ID: {chat}')
+    elif command in ('/alerts_on', '/alerts_off'):
+        enabled = int(command == '/alerts_on')
+        with connect() as db:
+            db.execute('INSERT INTO subscribers(chat_id,alerts) VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET alerts=excluded.alerts', (chat, enabled))
+        send(chat, 'Meldingen ingeschakeld.' if enabled else 'Meldingen uitgeschakeld.')
+    elif command == '/test':
+        send(chat, 'WEEX Moon testbericht ontvangen. Telegram werkt. Dit bevestigt nog geen scanner-signalen.')
+    elif command == '/status':
         with LOCK:
             state = dict(STATE)
-
-        age = (
-            int(time.time() - state["lastScan"])
-            if state["lastScan"]
-            else None
-        )
-
-        healthy = sum(
-            1
-            for item in state["symbols"].values()
-            if isinstance(item, dict)
-            and item.get("status") == "OK"
-        )
-
-        ok = (
-            age is not None
-            and 0 <= age <= 180
-            and not state["error"]
-        )
-
-        send(
-            chat_id,
-            f"Scanner: "
-            f"{'ACTUEEL' if ok else 'NIET ACTUEEL'}\n"
-            f"Laatste scan: "
-            f"{age if age is not None else '?'} "
-            f"seconden geleden\n"
-            f"Markten OK: {healthy}\n"
-            f"Setups in feed: "
-            f"{len(state['setups'])}\n"
-            f"Fout: {state['error'] or 'geen'}",
-        )
-
-    elif command == "/scan":
+        age = int(time.time() - state['lastScan']) if state['lastScan'] else None
+        ok = age is not None and 0 <= age <= 180 and not state['error']
+        healthy = sum(1 for item in state['symbols'].values() if item.get('status') == 'OK')
+        send(chat, f'Scanner: {"ACTUEEL" if ok else "NIET ACTUEEL"}\nLaatste scan: {age if age is not None else "?"} seconden geleden\nMarkten OK: {healthy}\nSetups in feed: {len(state["setups"])}\nFout: {state["error"] or "geen"}')
+    elif command == '/scan':
+        if not STATE['lastScan'] or time.time() - STATE['lastScan'] > 180 or STATE['error']:
+            try:
+                scanner_read()
+            except Exception:
+                pass
         with LOCK:
             state = dict(STATE)
-
-        if (
-            not state["lastScan"]
-            or time.time() - state["lastScan"] > 180
-            or state["error"]
-        ):
-            send(
-                chat_id,
-                "Geen actuele scannerdata. "
-                "Gebruik deze signalen niet.\n"
-                + str(state["error"]),
-            )
-
-        elif not state["setups"]:
-            send(
-                chat_id,
-                "Scanner actief. Geen bevestigde "
-                "setups op dit moment.",
-            )
-
+        if not state['lastScan'] or time.time() - state['lastScan'] > 180 or state['error']:
+            send(chat, 'Geen actuele scannerdata. Gebruik deze signalen niet.\n' + str(state['error']))
+        elif not state['setups']:
+            send(chat, 'Scanner actief. Geen bevestigde setups op dit moment. Dat is normaal.')
         else:
-            recent = sorted(
-                state["setups"],
-                key=lambda s: float(
-                    s.get("createdAt") or 0
-                ),
-                reverse=True,
-            )[:3]
-
-            send(
-                chat_id,
-                "Recente paper-setups "
-                "(niet per se nieuwe entries):\n\n"
-                + "\n\n".join(
-                    format_signal(s)
-                    for s in recent
-                ),
-            )
+            recent = sorted(state['setups'], key=lambda s: float(s.get('createdAt') or 0), reverse=True)[:5]
+            send(chat, 'Recente paper-setups (niet per se nieuwe entries):\n\n' + '\n\n'.join(format_signal(s) for s in recent))
 
 
-def telegram_loop():
-    global POLL_HEARTBEAT
-
-    lock_file = open(
-        "/tmp/weex_telegram_poll.lock",
-        "w",
-    )
-
-    try:
-        fcntl.flock(
-            lock_file,
-            fcntl.LOCK_EX | fcntl.LOCK_NB,
-        )
-    except BlockingIOError:
-        logging.error(
-            "Telegram polling already active "
-            "in this instance"
-        )
-        return
-
+def register_webhook_loop():
+    global WEBHOOK_STATE
     if not TOKEN:
-        logging.error(
-            "TELEGRAM_BOT_TOKEN ontbreekt"
-        )
+        WEBHOOK_STATE = "TELEGRAM_BOT_TOKEN ontbreekt"
+        logging.error(WEBHOOK_STATE)
         return
-
-    offset = None
-    conflicts = 0
-
+    url = PUBLIC_URL + WEBHOOK_PATH
     while True:
-        POLL_HEARTBEAT = time.time()
-
         try:
-            args = {
-                "timeout": 15,
-                "allowed_updates": json.dumps(
-                    ["message"]
-                ),
-            }
-
-            if offset is not None:
-                args["offset"] = offset
-
-            response = POLL_SESSION.get(
-                API + "/getUpdates",
-                params=args,
-                timeout=(5, 23),
+            response = requests.post(
+                API + '/setWebhook',
+                json={
+                    'url': url,
+                    'secret_token': WEBHOOK_SECRET,
+                    'allowed_updates': ['message'],
+                    'drop_pending_updates': False,
+                    'max_connections': 4,
+                },
+                timeout=(5, 15),
             )
-
             response.raise_for_status()
-
-            payload = response.json()
-
-            if not payload.get("ok"):
-                raise RuntimeError(
-                    "Telegram returned not ok"
-                )
-
-            POLL_HEARTBEAT = time.time()
-
-            for update in payload.get(
-                "result", []
-            ):
-                offset = update["update_id"] + 1
-
-                if "message" in update:
-                    try:
-                        process_message(
-                            update["message"]
-                        )
-                    except Exception as exc:
-                        logging.warning(
-                            "Command handler error: %s",
-                            type(exc).__name__,
-                        )
-
-            conflicts = 0
-
-            with LOCK:
-                STATE["telegram"] = (
-                    "polling actief"
-                )
-
+            result = response.json()
+            if not result.get('ok'):
+                raise RuntimeError('Telegram setWebhook returned not ok')
+            WEBHOOK_STATE = 'webhook geregistreerd'
+            logging.info('Telegram webhook registered')
+            return
         except Exception as exc:
-            status = getattr(
-                getattr(
-                    exc, "response", None
-                ),
-                "status_code",
-                None,
-            )
+            WEBHOOK_STATE = 'webhook registratiefout: ' + type(exc).__name__
+            logging.warning('Webhook registration failed: %s', type(exc).__name__)
+            time.sleep(30)
 
-            if status == 409:
-                conflicts += 1
-                delay = min(
-                    60, 10 * conflicts
-                )
-            else:
-                conflicts = 0
-                delay = 5
 
-            with LOCK:
-                STATE["telegram"] = (
-                    f"polling error "
-                    f"{type(exc).__name__} "
-                    f"HTTP {status or '?'}"
-                )
+@app.post(WEBHOOK_PATH)
+def telegram_webhook():
+    if not TOKEN or request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+        abort(403)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400)
+    message = data.get('message')
+    if isinstance(message, dict):
+        try:
+            process_message(message)
+        except Exception as exc:
+            logging.exception('Telegram command processing error: %s', type(exc).__name__)
+            return ('processing error', 503)
+    return ('ok', 200)
 
-            logging.warning(
-                "Telegram poll error: %s "
-                "HTTP %s",
-                type(exc).__name__,
-                status or "?",
-            )
 
-            time.sleep(delay)
+@app.get('/')
+def index():
+    return ('WEEX Moon webhook bridge v6 actief. Gebruik /status en /scan in @WeexMoonBot. '
+            'Scannergegevens zijn candle-gebaseerd, geen realtime mark prices.\n')
+
+
+@app.get('/api/status')
+def status():
+    with LOCK:
+        data = dict(STATE)
+    data['scanner_current'] = bool(data['lastScan'] and time.time() - data['lastScan'] <= 180 and not data['error'])
+    data['telegram'] = WEBHOOK_STATE
+    data['telegram_poll_age_seconds'] = round(time.time()-POLL_HEARTBEAT,1) if POLL_HEARTBEAT else None
+    data['telegram_worker_alive'] = bool(POLL_WORKER and POLL_WORKER.is_alive())
+    return jsonify(data)
 
 
 def watchdog_loop():
     global POLL_WORKER
-
     while True:
         time.sleep(15)
-
-        if (
-            POLL_WORKER
-            and not POLL_WORKER.is_alive()
-        ):
-            logging.error(
-                "Telegram worker stopped; restarting"
-            )
-
-            POLL_WORKER = threading.Thread(
-                target=telegram_loop,
-                daemon=True,
-                name="telegram-poll",
-            )
-
+        if POLL_WORKER is not None and not POLL_WORKER.is_alive():
+            logging.error('Telegram polling worker stopped; restarting')
+            POLL_WORKER = threading.Thread(target=telegram_loop, daemon=True, name='telegram-poll')
             POLL_WORKER.start()
+        elif POLL_HEARTBEAT and time.time()-POLL_HEARTBEAT>100:
+            logging.error('Telegram polling heartbeat stale: %.0fs',time.time()-POLL_HEARTBEAT)
 
-        elif (
-            POLL_HEARTBEAT
-            and time.time() - POLL_HEARTBEAT > 100
-        ):
-            logging.error(
-                "Telegram polling heartbeat stale"
-            )
-
-
-@app.get("/")
-def index():
-    return (
-        "WEEX Moon Telegram bridge v5.2 running"
-    )
-
-
-@app.get("/api/status")
-def status():
-    with LOCK:
-        data = dict(STATE)
-
-    data["scanner_current"] = bool(
-        data["lastScan"]
-        and 0 <= time.time() - data["lastScan"] <= 180
-        and not data["error"]
-    )
-
-    data["telegram_poll_age_seconds"] = (
-        round(
-            time.time() - POLL_HEARTBEAT,
-            1,
-        )
-        if POLL_HEARTBEAT
-        else None
-    )
-
-    data["telegram_worker_alive"] = bool(
-        POLL_WORKER
-        and POLL_WORKER.is_alive()
-    )
-
-    return jsonify(data)
-
+_started = False
 
 def start_workers():
-    global POLL_WORKER
-
-    connect().close()
-
-    threading.Thread(
-        target=scanner_loop,
-        daemon=True,
-        name="scanner",
-    ).start()
-
-    POLL_WORKER = threading.Thread(
-        target=telegram_loop,
-        daemon=True,
-        name="telegram-poll",
-    )
-
-    POLL_WORKER.start()
-
-    threading.Thread(
-        target=watchdog_loop,
-        daemon=True,
-        name="watchdog",
-    ).start()
+    global _started, POLL_WORKER
+    if not _started:
+        _started = True
+        connect().close()
+        threading.Thread(target=scanner_loop, daemon=True).start()
+        POLL_WORKER = threading.Thread(target=telegram_loop, daemon=True, name='telegram-poll')
+        POLL_WORKER.start()
+        threading.Thread(target=watchdog_loop, daemon=True, name='telegram-watchdog').start()
 
 
 start_workers()
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
-        threaded=True,
-    )
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')), threaded=True)

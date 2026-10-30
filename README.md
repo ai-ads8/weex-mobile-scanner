@@ -1,40 +1,45 @@
-# WEEX Entry Scanner — experimental v1
+# WEEX Moon v6.0
 
-A read-only WEEX futures scanner. Monitors BTC, ETH, SOL, XRP and DOGE USDT perpetual markets. Uses the official public WEEX REST API, no account connection needed.
+Read-only WEEX futures scanner with Telegram alerts, paper tracking and a trade analyzer.
+**No orders are ever placed.** Scores and quality grades are heuristics, not win probabilities.
 
-## Run
+## Files
 
-```bash
-cd weex-entry-scanner
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
+| File | Role |
+|---|---|
+| `app.py` | Scanner + dashboard (`/`), Trade Analyzer (`/trade`), API, optional direct Telegram alerts |
+| `signal_engine.py` | Pure signal logic (shared by live scanner, backtest and tests) |
+| `notifier.py` | Telegram sending and alert text |
+| `telegram_bot.py` | Telegram webhook commands (`/scan`, `/status`, ...) and optional alerts |
+| `trade_analyzer.py` | Rule-based position check |
+| `backtest.py` | Replays the live engine on historical candles (walk-forward, fees, latency) |
+| `tests/` | `python -m unittest discover -s tests` |
+| `deploy/` | systemd unit + env template for an always-on VM |
 
-Open http://localhost:8080
+## What changed in v6.0 (short)
 
-## Optional Telegram notifications
+- Scans start ~3 s after each candle close instead of at arbitrary moments (scalp latency).
+- Higher-timeframe candles are cached until a new one closes (≈30 instead of ≈170 WEEX calls/min).
+- Every setup gets a quality grade A/B/C from entry checks: chasing, rejection wick, climax candle,
+  BTC counter-trend, spread, late/failed price drift. The v5.1 score is kept unchanged for comparison.
+- Alerts only for fresh, quality-A setups (configurable), with cooldown and dedup.
+- Telegram subscribers are seeded from `ALERT_CHAT_IDS`, so restarts no longer silently unsubscribe you.
+- Paper tracking now uses 1m candles: realistic fill after latency, fees, slippage, MFE/MAE, time stop.
+- `/api/stats`: results by mode, quality, score bracket, side, pair.
 
-Create a Telegram bot with BotFather, start a conversation with it, get your chat ID and set:
+## Environment variables
 
-```bash
-export TELEGRAM_BOT_TOKEN='your_bot_token'
-export TELEGRAM_CHAT_ID='your_chat_id'
-python app.py
-```
+Scanner: `TELEGRAM_BOT_TOKEN`, `ALERT_CHAT_IDS`, `ALERTS_FROM_SCANNER` (1/0), `ALERT_MIN_QUALITY` (A/B/C),
+`APP_ACCESS_TOKEN` (enables `/api/positions`), `SCANNER_DB_PATH`, `SCAN_SYMBOLS`, `SCAN_INTERVAL_SECONDS`,
+`SCAN_OFFSET_SECONDS`, `PAPER_FEE_PCT_ROUNDTRIP`, `PAPER_SLIPPAGE_PCT`, `PAPER_LATENCY_SECONDS`.
 
-Keep the Python process running to receive alerts. For 24/7 operation, deploy to an always-on server or VPS. The browser can be closed while the server runs. Never publish your Telegram bot token.
+Bot: `TELEGRAM_BOT_TOKEN`, `ALERT_CHAT_IDS`, `BOT_SENDS_ALERTS` (set `0` when the scanner sends),
+`SCANNER_URL`, `PUBLIC_URL`, `WEBHOOK_SECRET` (optional), `DB_PATH`.
 
-## Strategy (UNVALIDATED)
+Let exactly one service send alerts, otherwise you get each alert twice.
 
-On every 30-second scan, pull closed 5m, 15m and 1h candles. Confirm 15m and 1h EMA20 vs EMA50 direction, then check 5m close above previous 20-bar high (LONG) or below previous 20-bar low (SHORT), with volume >= 1.2 times the previous 20-bar average. SL is beyond prior 20-bar opposite extreme or 1.5 ATR, whichever is farther. TP1=2R and TP2=3R. Signal deduplicated per closed 5m candle per pair per process. WAIT means no confirmed signal.
+## Limits
 
-## Important limitations
-
-- This is an experimental pattern detector, NOT a profitable or validated strategy. Backtest and paper trade first.
-- Signals can arrive after breakout, and stop-loss can be extremely wide; do not assume every alert is tradable.
-- No automatic orders, balance access, live liquidation calculation, or wallet sizing.
-- WEEX API may be blocked by geography/network, or change format/rate limits.
-- A restart resets alert deduplication; production should persist state, add logging, uptime monitoring, retries, historical evaluation, and Telegram delivery diagnostics.
-- Cross margin with 50x/200x leverage can liquidate before a stop-loss executes and can put more than the initial margin at risk.
+- Render free services sleep after 15 min without inbound traffic and lose `/tmp` data. Alerts then stop.
+- WEEX REST quotes are snapshots; entry levels are references, not executable prices.
+- Nothing here is validated as profitable. Use `/api/stats` and `backtest.py` before trusting any filter.

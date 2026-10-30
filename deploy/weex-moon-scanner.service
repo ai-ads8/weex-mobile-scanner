@@ -1,0 +1,18 @@
+# Always-on VM (e.g. Oracle Cloud Always Free). Copy to /etc/systemd/system/
+[Unit]
+Description=WEEX Moon scanner (scanner + Telegram alerts + dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=weex
+WorkingDirectory=/opt/weex-moon
+EnvironmentFile=/opt/weex-moon/.env
+Environment=SCANNER_DB_PATH=/opt/weex-moon/data/signals.sqlite3
+Environment=PORT=8080
+ExecStart=/opt/weex-moon/.venv/bin/python app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

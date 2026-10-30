@@ -1,11 +1,30 @@
+# Reference only: documents the two existing Render services (created manually).
+# Free web services sleep after 15 min without INBOUND traffic and lose /tmp data.
 services:
   - type: web
-    name: weex-mobile-scanner
-    runtime: docker
-    plan: starter
-    healthCheckPath: /api/signals
+    name: weex-moon-scanner-live
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /api/health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: TELEGRAM_CHAT_ID
+      - key: ALERT_CHAT_IDS
         sync: false
+      - key: APP_ACCESS_TOKEN
+        sync: false
+  - type: web
+    name: weex-moon-bot-live
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALERT_CHAT_IDS
+        sync: false
+      - key: BOT_SENDS_ALERTS
+        value: "0"

@@ -1,10 +1,13 @@
+name: WEEX health check (manual)
 
-name: WEEX Uptime Monitor
-
+# v6.0: the 5-minute schedule was removed.
+# - It pinged a non-existent host (moon-scanner-live instead of weex-moon-scanner-live),
+#   so it never did anything.
+# - Pinging a free Render service only to stop it sleeping is a keep-alive pattern;
+#   GitHub cron is also best-effort (delays, skipped runs, auto-disabled after 60 days
+#   of repo inactivity). It is not a reliable base for trading alerts.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
@@ -13,13 +16,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 3
-
     steps:
-      - name: Check scanner
+      - name: Check scanner health
         run: |
-          curl --fail --show-error \
-            --max-time 90 \
-            --retry 2 \
-            --retry-delay 5 \
-            "https://moon-scanner-live.onrender.com/api/health"
-
+          curl --fail --show-error --max-time 90 --retry 2 --retry-delay 5 \
+            "https://weex-moon-scanner-live.onrender.com/api/health"

@@ -1,1 +1,25 @@
 
+name: WEEX Uptime Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Check scanner
+        run: |
+          curl --fail --show-error \
+            --max-time 90 \
+            --retry 2 \
+            --retry-delay 5 \
+            "https://moon-scanner-live.onrender.com/health"
+

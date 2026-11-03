@@ -1,11 +1,13 @@
 
-"""WEEX Moon v7.4 — Telegram webhook + GitHub wake."""
+"""WEEX Moon v7.5 — Telegram Bot + GitHub Wake."""
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -13,18 +15,22 @@ import requests
 from flask import Flask, abort, jsonify, request
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("weex-moon")
 
 app = Flask(__name__)
 
-VERSION = "v7.4"
+VERSION = "v7.5"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API = f"https://api.telegram.org/bot{TOKEN}"
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-PUBLIC_URL = os.getenv(
-    "PUBLIC_URL",
-    "https://weex-moon-bot-live.onrender.com"
-).rstrip("/")
+GITHUB_WAKE_TOKEN = os.getenv(
+    "GITHUB_WAKE_TOKEN", ""
+).strip()
+
+ALLOWED_CHAT_ID = os.getenv(
+    "TELEGRAM_ALLOWED_CHAT_ID", ""
+).strip()
 
 REPO = os.getenv(
     "MOON_GITHUB_REPO",
@@ -36,19 +42,18 @@ BRANCH = os.getenv(
     "main"
 ).strip()
 
-GITHUB_WAKE_TOKEN = os.getenv(
-    "GITHUB_WAKE_TOKEN", ""
-).strip()
-
-ALLOWED_CHAT_ID = os.getenv(
-    "TELEGRAM_ALLOWED_CHAT_ID", ""
-).strip()
+PUBLIC_URL = os.getenv(
+    "PUBLIC_URL",
+    "https://weex-moon-bot-live.onrender.com"
+).rstrip("/")
 
 MAX_AGE = int(
     os.getenv("MOON_STATE_MAX_AGE_SECONDS", "900")
 )
 
 TOTAL_MARKETS = 15
+
+API = f"https://api.telegram.org/bot{TOKEN}"
 
 SECRET = (
     hashlib.sha256(
@@ -67,18 +72,29 @@ PATH = (
 
 STARTED_AT = int(time.time())
 
+WAKE_COOLDOWN = 60
+last_wake = 0
+wake_lock = threading.Lock()
+
+
+# -----------------------------
+# TELEGRAM
+# -----------------------------
 
 def tg(method, payload):
     if not TOKEN:
-        raise RuntimeError("Telegram-token ontbreekt")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN ontbreekt"
+        )
 
     response = requests.post(
-        API + "/" + method,
+        f"{API}/{method}",
         json=payload,
         timeout=(5, 20)
     )
 
     response.raise_for_status()
+
     data = response.json()
 
     if not data.get("ok"):
@@ -100,31 +116,67 @@ def send(chat, message):
         )
 
 
-def state_url():
-    return (
-        f"https://raw.githubusercontent.com/"
-        f"{REPO}/{BRANCH}/moon_state.json"
-    )
-
+# -----------------------------
+# GITHUB SCANNERDATA
+# -----------------------------
 
 def load_state():
+    url = (
+        f"https://api.github.com/repos/{REPO}/"
+        "contents/moon_state.json"
+    )
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Cache-Control": "no-cache",
+        "User-Agent": "WEEX-Moon-v7.5"
+    }
+
+    if GITHUB_WAKE_TOKEN:
+        headers["Authorization"] = (
+            f"Bearer {GITHUB_WAKE_TOKEN}"
+        )
+
     response = requests.get(
-        state_url(),
-        params={"t": str(time.time_ns())},
-        headers={
-            "User-Agent": "WEEX-Moon-v7.4",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache"
+        url,
+        params={
+            "ref": BRANCH,
+            "t": str(time.time_ns())
         },
+        headers=headers,
         timeout=(5, 15)
     )
 
+    if response.status_code == 404:
+        raise RuntimeError(
+            "moon_state.json niet gevonden"
+        )
+
+    if response.status_code in (401, 403, 429):
+        raise RuntimeError(
+            f"GitHub API HTTP {response.status_code}"
+        )
+
     response.raise_for_status()
 
-    data = response.json()
+    result = response.json()
+
+    if result.get("encoding") != "base64":
+        raise RuntimeError(
+            "GitHub gaf geen base64-bestand terug"
+        )
+
+    decoded = base64.b64decode(
+        result["content"]
+    ).decode("utf-8")
+
+    data = json.loads(decoded)
 
     if not isinstance(data, dict):
-        raise RuntimeError("Ongeldige scannerdata")
+        raise RuntimeError(
+            "Ongeldige scannerdata"
+        )
 
     stamp = int(data.get("lastRun") or 0)
 
@@ -149,6 +201,10 @@ def load_state():
     return data, age
 
 
+# -----------------------------
+# SIGNALEN
+# -----------------------------
+
 def fmt(value):
     try:
         return f"{float(value):.8g}"
@@ -159,7 +215,7 @@ def fmt(value):
 def setup_text(setup):
     return (
         f"{setup.get('symbol', '?')} "
-        f"{setup.get('side', '?')} | PAPER SETUP\n"
+        f"{setup.get('side', '?')}\n"
         f"Score: {setup.get('score', '?')}/100 "
         "(geen winstkans)\n"
         f"Entry: {fmt(setup.get('entry'))}\n"
@@ -167,21 +223,30 @@ def setup_text(setup):
         f"TP1: {fmt(setup.get('tp1'))}\n"
         f"Volume: {fmt(setup.get('volume'))}x\n"
         f"Trend: {setup.get('aligned', '?')}/3\n"
-        "Controleer actuele koers, margin "
-        "en liquidatierisico."
+        "Paper-setup. Controleer actuele koers, "
+        "margin en liquidatierisico."
     )
 
 
+# -----------------------------
+# WAKE SCANNER
+# -----------------------------
+
 def wake_scan(chat):
+    global last_wake
+
     if not ALLOWED_CHAT_ID:
         send(
             chat,
-            "TELEGRAM_ALLOWED_CHAT_ID ontbreekt in Render."
+            "TELEGRAM_ALLOWED_CHAT_ID ontbreekt."
         )
         return
 
     if str(chat) != ALLOWED_CHAT_ID:
-        send(chat, "Geen toestemming voor /wake.")
+        send(
+            chat,
+            "Geen toestemming voor /wake."
+        )
         return
 
     if not GITHUB_WAKE_TOKEN:
@@ -191,62 +256,83 @@ def wake_scan(chat):
         )
         return
 
-    url = (
-        f"https://api.github.com/repos/{REPO}/"
-        "actions/workflows/"
-        "weex-moon-v7.yml/dispatches"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization":
-                    f"Bearer {GITHUB_WAKE_TOKEN}",
-                "Accept":
-                    "application/vnd.github+json",
-                "X-GitHub-Api-Version":
-                    "2022-11-28"
-            },
-            json={
-                "ref": BRANCH,
-                "inputs": {
-                    "test_message": "true"
-                }
-            },
-            timeout=(5, 15)
+    with wake_lock:
+        remaining = WAKE_COOLDOWN - (
+            time.time() - last_wake
         )
 
-        if response.status_code == 204:
+        if remaining > 0:
             send(
                 chat,
-                "WEEX Moon v7.4\n"
-                "Nieuwe scan aangevraagd!\n\n"
-                "GitHub Actions controleert "
-                "de 15 coins.\n"
-                "Wacht op het testbericht.\n"
-                "Gebruik daarna /status."
+                f"Wacht nog {int(remaining) + 1} "
+                "seconden voordat je opnieuw scant."
             )
+            return
 
-        else:
-            logging.error(
-                "GitHub dispatch HTTP %s",
-                response.status_code
-            )
-
-            send(
-                chat,
-                "Scan starten mislukt.\n"
-                f"GitHub HTTP {response.status_code}."
-            )
-
-    except requests.RequestException:
-        logging.exception("Wake request failed")
-        send(
-            chat,
-            "GitHub tijdelijk niet bereikbaar."
+        url = (
+            f"https://api.github.com/repos/{REPO}/"
+            "actions/workflows/"
+            "weex-moon-v7.yml/dispatches"
         )
 
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization":
+                        f"Bearer {GITHUB_WAKE_TOKEN}",
+                    "Accept":
+                        "application/vnd.github+json",
+                    "X-GitHub-Api-Version":
+                        "2022-11-28"
+                },
+                json={
+                    "ref": BRANCH,
+                    "inputs": {
+                        "test_message": "true"
+                    }
+                },
+                timeout=(5, 15)
+            )
+
+            if response.status_code == 204:
+                last_wake = time.time()
+
+                send(
+                    chat,
+                    f"WEEX Moon {VERSION}\n"
+                    "Nieuwe scan aangevraagd!\n\n"
+                    "GitHub Actions controleert "
+                    "15 coins.\n"
+                    "Wacht op het testbericht.\n"
+                    "Gebruik daarna /status."
+                )
+
+            else:
+                log.error(
+                    "GitHub dispatch HTTP %s: %s",
+                    response.status_code,
+                    response.text[:300]
+                )
+
+                send(
+                    chat,
+                    "Scan starten mislukt.\n"
+                    f"GitHub HTTP {response.status_code}."
+                )
+
+        except requests.RequestException:
+            log.exception("Wake request failed")
+
+            send(
+                chat,
+                "GitHub tijdelijk niet bereikbaar."
+            )
+
+
+# -----------------------------
+# COMMANDO'S
+# -----------------------------
 
 def process_message(message):
     chat = (message.get("chat") or {}).get("id")
@@ -270,7 +356,10 @@ def process_message(message):
         )
 
     elif command == "/whoami":
-        send(chat, f"Chat-ID: {chat}")
+        send(
+            chat,
+            f"Chat-ID: {chat}"
+        )
 
     elif command == "/wake":
         wake_scan(chat)
@@ -287,24 +376,29 @@ def process_message(message):
             "/alerts_on - meldingeninformatie\n"
             "/alerts_off - meldingeninformatie\n\n"
             "15 coins via GitHub Actions.\n"
-            "Geen automatische trade-executie."
+            "Geen automatische orders."
         )
 
-    elif command in ("/alerts_on", "/alerts_off"):
+    elif command in (
+        "/alerts_on",
+        "/alerts_off"
+    ):
         send(
             chat,
             "Automatische alerts worden "
-            "beheerd door GitHub Actions.\n"
-            "Dit commando verandert de "
-            "meldingen momenteel niet."
+            "door GitHub Actions beheerd.\n"
+            "Dit commando wijzigt ze niet."
         )
 
-    elif command in ("/scan", "/status"):
+    elif command in (
+        "/scan",
+        "/status"
+    ):
         try:
             state, age = load_state()
 
         except Exception as exc:
-            logging.warning(
+            log.warning(
                 "Scannerdata unavailable: %s",
                 exc
             )
@@ -325,13 +419,17 @@ def process_message(message):
 
         setups = (
             state.get("setups")
-            if isinstance(state.get("setups"), list)
+            if isinstance(
+                state.get("setups"), list
+            )
             else []
         )
 
         errors = (
             state.get("errors")
-            if isinstance(state.get("errors"), list)
+            if isinstance(
+                state.get("errors"), list
+            )
             else []
         )
 
@@ -346,7 +444,8 @@ def process_message(message):
                 f"WEEX Moon {VERSION} | ACTUEEL\n"
                 f"Laatste scan: {stamp}\n"
                 f"Leeftijd: {age} sec\n"
-                f"Markten OK: {markets}/{TOTAL_MARKETS}\n"
+                f"Markten OK: "
+                f"{markets}/{TOTAL_MARKETS}\n"
                 f"Paper-setups: {len(setups)}\n"
                 f"Fouten: {len(errors)}\n"
                 "Bron: GitHub Actions\n"
@@ -372,8 +471,10 @@ def process_message(message):
                 send(
                     chat,
                     f"WEEX Moon {VERSION}\n"
-                    f"Laatste scan: {age} sec geleden\n"
-                    f"Markten: {markets}/{TOTAL_MARKETS}\n"
+                    f"Laatste scan: "
+                    f"{age} sec geleden\n"
+                    f"Markten: "
+                    f"{markets}/{TOTAL_MARKETS}\n"
                     "Geen bevestigde paper-setups.\n"
                     "Dit is geen realtime scan."
                 )
@@ -381,7 +482,8 @@ def process_message(message):
             else:
                 message_text = (
                     f"WEEX Moon {VERSION}\n"
-                    f"Laatste scan: {age} sec geleden\n"
+                    f"Laatste scan: "
+                    f"{age} sec geleden\n"
                     "Historische paper-setups, "
                     "GEEN live entries:\n\n"
                 )
@@ -391,7 +493,10 @@ def process_message(message):
                     for s in valid[:3]
                 )
 
-                send(chat, message_text)
+                send(
+                    chat,
+                    message_text
+                )
 
     elif command.startswith("/"):
         send(
@@ -400,6 +505,10 @@ def process_message(message):
             "Gebruik /start voor alle commando's."
         )
 
+
+# -----------------------------
+# WEBHOOK
+# -----------------------------
 
 @app.post(PATH)
 def webhook():
@@ -413,14 +522,18 @@ def webhook():
     ):
         abort(403)
 
-    update = request.get_json(silent=True) or {}
+    update = request.get_json(
+        silent=True
+    ) or {}
 
     if update.get("message"):
         try:
-            process_message(update["message"])
+            process_message(
+                update["message"]
+            )
 
         except Exception:
-            logging.exception(
+            log.exception(
                 "Telegram update failed"
             )
             return jsonify(ok=False), 500
@@ -440,20 +553,24 @@ def home():
 def health():
     return jsonify(
         version=VERSION,
-        uptimeSeconds=int(time.time()) - STARTED_AT,
+        uptimeSeconds=(
+            int(time.time()) - STARTED_AT
+        ),
         webhookConfigured=bool(TOKEN),
         scanner="GitHub Actions"
     )
 
 
+# -----------------------------
+# WEBHOOK REGISTREREN
+# -----------------------------
+
 def configure_webhook():
     if not TOKEN:
-        logging.error(
+        log.error(
             "TELEGRAM_BOT_TOKEN ontbreekt"
         )
         return
-
-    import threading
 
     def work():
         for attempt in range(5):
@@ -463,20 +580,21 @@ def configure_webhook():
                     {
                         "url": PUBLIC_URL + PATH,
                         "secret_token": SECRET,
-                        "allowed_updates": ["message"],
+                        "allowed_updates": [
+                            "message"
+                        ],
                         "drop_pending_updates": False
                     }
                 )
 
-                logging.info(
+                log.info(
                     "Telegram webhook configured"
                 )
                 return
 
             except Exception:
-                logging.exception(
-                    "Webhook registration attempt %s failed",
-                    attempt + 1
+                log.exception(
+                    "Webhook registration failed"
                 )
 
                 time.sleep(
@@ -495,6 +613,8 @@ configure_webhook()
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
+        port=int(
+            os.getenv("PORT", "10000")
+        ),
         threaded=True
     )

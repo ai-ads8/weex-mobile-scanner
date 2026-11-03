@@ -1,9 +1,5 @@
 
-"""WEEX Moon v7.3 — Telegram webhook.
-
-Reads the latest scheduled GitHub Actions scan state.
-Does not execute trades or initiate real-time scans.
-"""
+"""WEEX Moon v7.4 — Telegram webhook + GitHub wake."""
 
 import hashlib
 import hmac
@@ -20,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
-VERSION = "v7.3"
+VERSION = "v7.4"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
@@ -40,9 +36,19 @@ BRANCH = os.getenv(
     "main"
 ).strip()
 
+GITHUB_WAKE_TOKEN = os.getenv(
+    "GITHUB_WAKE_TOKEN", ""
+).strip()
+
+ALLOWED_CHAT_ID = os.getenv(
+    "TELEGRAM_ALLOWED_CHAT_ID", ""
+).strip()
+
 MAX_AGE = int(
     os.getenv("MOON_STATE_MAX_AGE_SECONDS", "900")
 )
+
+TOTAL_MARKETS = 15
 
 SECRET = (
     hashlib.sha256(
@@ -64,9 +70,7 @@ STARTED_AT = int(time.time())
 
 def tg(method, payload):
     if not TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN ontbreekt in Render"
-        )
+        raise RuntimeError("Telegram-token ontbreekt")
 
     response = requests.post(
         API + "/" + method,
@@ -79,8 +83,7 @@ def tg(method, payload):
 
     if not data.get("ok"):
         raise RuntimeError(
-            "Telegram: " +
-            str(data.get("description", "unknown"))
+            str(data.get("description", "Telegram error"))
         )
 
     return data.get("result")
@@ -98,11 +101,6 @@ def send(chat, message):
 
 
 def state_url():
-    if not REPO or "/" not in REPO:
-        raise RuntimeError(
-            "MOON_GITHUB_REPO ongeldig"
-        )
-
     return (
         f"https://raw.githubusercontent.com/"
         f"{REPO}/{BRANCH}/moon_state.json"
@@ -110,50 +108,29 @@ def state_url():
 
 
 def load_state():
-    # Unique query parameter helps bypass cached copies.
-    cache_buster = str(time.time_ns())
-
     response = requests.get(
         state_url(),
-        params={"t": cache_buster},
+        params={"t": str(time.time_ns())},
         headers={
-            "User-Agent": "WEEX-Moon-Telegram-v7.3",
+            "User-Agent": "WEEX-Moon-v7.4",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache"
         },
         timeout=(5, 15)
     )
 
-    if response.status_code == 404:
-        raise RuntimeError(
-            "moon_state.json niet gevonden op GitHub"
-        )
-
-    if response.status_code in (401, 403, 429):
-        raise RuntimeError(
-            f"GitHub-toegang mislukt: HTTP "
-            f"{response.status_code}"
-        )
-
     response.raise_for_status()
 
-    try:
-        data = response.json()
-    except ValueError:
-        raise RuntimeError(
-            "GitHub gaf geen geldige JSON terug"
-        )
+    data = response.json()
 
     if not isinstance(data, dict):
-        raise RuntimeError(
-            "Ongeldige moon_state.json"
-        )
+        raise RuntimeError("Ongeldige scannerdata")
 
     stamp = int(data.get("lastRun") or 0)
 
     if not stamp:
         raise RuntimeError(
-            "Geen lastRun-tijdstip gevonden"
+            "Geen scantijd beschikbaar"
         )
 
     age = int(time.time()) - stamp
@@ -184,15 +161,91 @@ def setup_text(setup):
         f"{setup.get('symbol', '?')} "
         f"{setup.get('side', '?')} | PAPER SETUP\n"
         f"Score: {setup.get('score', '?')}/100 "
-        f"(geen winstkans)\n"
-        f"Candle entry: {fmt(setup.get('entry'))}\n"
+        "(geen winstkans)\n"
+        f"Entry: {fmt(setup.get('entry'))}\n"
         f"Stop: {fmt(setup.get('stop'))}\n"
         f"TP1: {fmt(setup.get('tp1'))}\n"
         f"Volume: {fmt(setup.get('volume'))}x\n"
         f"Trend: {setup.get('aligned', '?')}/3\n"
-        "Geen live entry. Controleer actuele koers, "
-        "spread, margin en liquidatierisico."
+        "Controleer actuele koers, margin "
+        "en liquidatierisico."
     )
+
+
+def wake_scan(chat):
+    if not ALLOWED_CHAT_ID:
+        send(
+            chat,
+            "TELEGRAM_ALLOWED_CHAT_ID ontbreekt in Render."
+        )
+        return
+
+    if str(chat) != ALLOWED_CHAT_ID:
+        send(chat, "Geen toestemming voor /wake.")
+        return
+
+    if not GITHUB_WAKE_TOKEN:
+        send(
+            chat,
+            "GITHUB_WAKE_TOKEN ontbreekt in Render."
+        )
+        return
+
+    url = (
+        f"https://api.github.com/repos/{REPO}/"
+        "actions/workflows/"
+        "weex-moon-v7.yml/dispatches"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization":
+                    f"Bearer {GITHUB_WAKE_TOKEN}",
+                "Accept":
+                    "application/vnd.github+json",
+                "X-GitHub-Api-Version":
+                    "2022-11-28"
+            },
+            json={
+                "ref": BRANCH,
+                "inputs": {
+                    "test_message": "true"
+                }
+            },
+            timeout=(5, 15)
+        )
+
+        if response.status_code == 204:
+            send(
+                chat,
+                "WEEX Moon v7.4\n"
+                "Nieuwe scan aangevraagd!\n\n"
+                "GitHub Actions controleert "
+                "de 15 coins.\n"
+                "Wacht op het testbericht.\n"
+                "Gebruik daarna /status."
+            )
+
+        else:
+            logging.error(
+                "GitHub dispatch HTTP %s",
+                response.status_code
+            )
+
+            send(
+                chat,
+                "Scan starten mislukt.\n"
+                f"GitHub HTTP {response.status_code}."
+            )
+
+    except requests.RequestException:
+        logging.exception("Wake request failed")
+        send(
+            chat,
+            "GitHub tijdelijk niet bereikbaar."
+        )
 
 
 def process_message(message):
@@ -219,26 +272,31 @@ def process_message(message):
     elif command == "/whoami":
         send(chat, f"Chat-ID: {chat}")
 
+    elif command == "/wake":
+        wake_scan(chat)
+
     elif command in ("/start", "/help"):
         send(
             chat,
             f"WEEX Moon {VERSION}\n\n"
-            "/scan - laatste GitHub-scan\n"
+            "/wake - nieuwe scan aanvragen\n"
+            "/scan - laatste scanresultaten\n"
             "/status - scannerstatus\n"
-            "/test - webhook testen\n"
+            "/test - Telegram testen\n"
             "/whoami - chat-ID\n"
             "/alerts_on - meldingeninformatie\n"
             "/alerts_off - meldingeninformatie\n\n"
-            "Automatische alerts worden rechtstreeks "
-            "door GitHub Actions verstuurd."
+            "15 coins via GitHub Actions.\n"
+            "Geen automatische trade-executie."
         )
 
     elif command in ("/alerts_on", "/alerts_off"):
         send(
             chat,
-            "Automatische v7-meldingen worden beheerd "
-            "door GitHub Actions.\n"
-            "Dit commando wijzigt de meldingen niet."
+            "Automatische alerts worden "
+            "beheerd door GitHub Actions.\n"
+            "Dit commando verandert de "
+            "meldingen momenteel niet."
         )
 
     elif command in ("/scan", "/status"):
@@ -247,7 +305,7 @@ def process_message(message):
 
         except Exception as exc:
             logging.warning(
-                "GitHub state unavailable: %s",
+                "Scannerdata unavailable: %s",
                 exc
             )
 
@@ -256,8 +314,8 @@ def process_message(message):
                 f"WEEX Moon {VERSION} | "
                 "GEEN ACTUELE SCANNERDATA\n"
                 f"{str(exc)[:240]}\n"
-                "Gebruik geen oude setups als "
-                "actuele entries."
+                "Gebruik geen oude setups "
+                "als actuele entries."
             )
             return
 
@@ -288,11 +346,11 @@ def process_message(message):
                 f"WEEX Moon {VERSION} | ACTUEEL\n"
                 f"Laatste scan: {stamp}\n"
                 f"Leeftijd: {age} sec\n"
-                f"Markten OK: {markets}/8\n"
+                f"Markten OK: {markets}/{TOTAL_MARKETS}\n"
                 f"Paper-setups: {len(setups)}\n"
                 f"Fouten: {len(errors)}\n"
-                "Bron: GitHub Actions / moon_state.json\n"
-                "Scans zijn gepland, niet realtime."
+                "Bron: GitHub Actions\n"
+                "Scans zijn niet realtime."
             )
 
         else:
@@ -315,9 +373,9 @@ def process_message(message):
                     chat,
                     f"WEEX Moon {VERSION}\n"
                     f"Laatste scan: {age} sec geleden\n"
-                    f"Markten: {markets}/8\n"
+                    f"Markten: {markets}/{TOTAL_MARKETS}\n"
                     "Geen bevestigde paper-setups.\n"
-                    "Dit is geen nieuwe realtime scan."
+                    "Dit is geen realtime scan."
                 )
 
             else:
@@ -339,7 +397,7 @@ def process_message(message):
         send(
             chat,
             "Onbekend commando.\n"
-            "Gebruik /start /scan /status /test /whoami"
+            "Gebruik /start voor alle commando's."
         )
 
 
@@ -384,7 +442,7 @@ def health():
         version=VERSION,
         uptimeSeconds=int(time.time()) - STARTED_AT,
         webhookConfigured=bool(TOKEN),
-        scanner="GitHub Actions state"
+        scanner="GitHub Actions"
     )
 
 

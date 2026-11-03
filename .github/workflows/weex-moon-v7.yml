@@ -1,1 +1,47 @@
+name: WEEX Moon v7
 
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: Send a Telegram test message
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weex-moon-v7
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Scan and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MOON_TEST_MESSAGE: ${{ inputs.test_message && '1' || '0' }}
+        run: python moon_scheduled.py
+
+      - name: Persist scan state
+        run: |
+          git config user.name "weex-moon[bot]"
+          git config user.email "weex-moon[bot]@users.noreply.github.com"
+          git add moon_state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update WEEX Moon state [skip ci]"
+            git push
+          fi

@@ -1,8 +1,22 @@
 {
   "version": "v7",
-  "lastRun": 1793733956,
+  "lastRun": 1793734260,
   "marketsOK": 15,
   "errors": [],
-  "setups": [],
+  "setups": [
+    {
+      "id": "QNTUSDT:5m:SHORT:1793733900000",
+      "symbol": "QNTUSDT",
+      "side": "SHORT",
+      "score": 62,
+      "entry": 190.7,
+      "stop": 195.28,
+      "tp1": 181.53999999999996,
+      "mark": 190.72,
+      "last": 190.73,
+      "volume": 1.15,
+      "aligned": 3
+    }
+  ],
   "sent": {}
 }

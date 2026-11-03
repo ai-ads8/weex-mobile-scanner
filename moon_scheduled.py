@@ -1,7 +1,7 @@
 import os,json,time,math,urllib.request,urllib.parse
 from pathlib import Path
 BASE='https://api-contract.weex.com/capi/v3/market'
-SYMS=os.getenv('MOON_SYMBOLS','BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,HBARUSDT,UNIUSDT,INJUSDT,TRXUSDT').split(',')
+SYMS=os.getenv('MOON_SYMBOLS','BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,HBARUSDT,UNIUSDT,INJUSDT,TRXUSDT,APTUSDT,QNTUSDT,ARBUSDT,OPUSDT,SUIUSDT,NEARUSDT,ADAUSDT').split(',')
 TFS={'5m':300,'15m':900,'1h':3600}
 def api(path,params=None):
  url=BASE+path+('?' + urllib.parse.urlencode(params) if params else '')

@@ -1,8 +1,24 @@
 {
   "version": "v7",
-  "lastRun": 1793828081,
+  "lastRun": 1793843157,
   "marketsOK": 15,
   "errors": [],
-  "setups": [],
-  "sent": {}
+  "setups": [
+    {
+      "id": "INJUSDT:5m:LONG:1793842800000",
+      "symbol": "INJUSDT",
+      "side": "LONG",
+      "score": 88,
+      "entry": 8.039,
+      "stop": 7.902,
+      "tp1": 8.312999999999999,
+      "mark": 8.048,
+      "last": 8.046,
+      "volume": 9.36,
+      "aligned": 3
+    }
+  ],
+  "sent": {
+    "INJUSDT:5m:LONG:1793842800000": 1793843157
+  }
 }

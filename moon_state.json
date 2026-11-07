@@ -1,23 +1,9 @@
 {
   "version": "v7",
-  "lastRun": 1794015750,
+  "lastRun": 1794037714,
   "marketsOK": 15,
   "errors": [],
-  "setups": [
-    {
-      "id": "ETHUSDT:5m:LONG:1794015300000",
-      "symbol": "ETHUSDT",
-      "side": "LONG",
-      "score": 47,
-      "entry": 2245.05,
-      "stop": 2236.76,
-      "tp1": 2261.63,
-      "mark": 2244.94,
-      "last": 2244.94,
-      "volume": 1.32,
-      "aligned": 2
-    }
-  ],
+  "setups": [],
   "sent": {
     "INJUSDT:5m:LONG:1793842800000": 1793843157
   }

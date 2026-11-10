@@ -1,9 +1,36 @@
 {
   "version": "v7",
-  "lastRun": 1794279368,
+  "lastRun": 1794307504,
   "marketsOK": 15,
   "errors": [],
-  "setups": [],
+  "setups": [
+    {
+      "id": "HBARUSDT:5m:SHORT:1794307200000",
+      "symbol": "HBARUSDT",
+      "side": "SHORT",
+      "score": 59,
+      "entry": 0.06629,
+      "stop": 0.06702,
+      "tp1": 0.06483000000000001,
+      "mark": 0.0663,
+      "last": 0.06629,
+      "volume": 1.12,
+      "aligned": 2
+    },
+    {
+      "id": "ARBUSDT:5m:SHORT:1794307200000",
+      "symbol": "ARBUSDT",
+      "side": "SHORT",
+      "score": 49,
+      "entry": 0.16501,
+      "stop": 0.16946,
+      "tp1": 0.15610999999999997,
+      "mark": 0.16502,
+      "last": 0.16497,
+      "volume": 1.15,
+      "aligned": 2
+    }
+  ],
   "sent": {
     "INJUSDT:5m:LONG:1793842800000": 1793843157
   }

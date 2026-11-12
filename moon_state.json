@@ -1,10 +1,8 @@
 {
   "version": "v7",
-  "lastRun": 1794442437,
+  "lastRun": 1794467693,
   "marketsOK": 15,
   "errors": [],
   "setups": [],
-  "sent": {
-    "INJUSDT:5m:LONG:1793842800000": 1793843157
-  }
+  "sent": {}
 }

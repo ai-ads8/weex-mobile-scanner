@@ -1,22 +1,8 @@
 {
   "version": "v7",
-  "lastRun": 1794537480,
+  "lastRun": 1794563870,
   "marketsOK": 15,
   "errors": [],
-  "setups": [
-    {
-      "id": "UNIUSDT:5m:SHORT:1794537000000",
-      "symbol": "UNIUSDT",
-      "side": "SHORT",
-      "score": 51,
-      "entry": 5.915,
-      "stop": 6.097,
-      "tp1": 5.550999999999999,
-      "mark": 5.908,
-      "last": 5.908,
-      "volume": 1.47,
-      "aligned": 3
-    }
-  ],
+  "setups": [],
   "sent": {}
 }

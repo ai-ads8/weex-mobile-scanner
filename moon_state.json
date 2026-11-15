@@ -1,23 +1,9 @@
 {
   "version": "v7",
-  "lastRun": 1794751673,
+  "lastRun": 1794771893,
   "marketsOK": 15,
   "errors": [],
-  "setups": [
-    {
-      "id": "APTUSDT:5m:SHORT:1794751200000",
-      "symbol": "APTUSDT",
-      "side": "SHORT",
-      "score": 82,
-      "entry": 0.4537,
-      "stop": 0.4583,
-      "tp1": 0.4445,
-      "mark": 0.4517,
-      "last": 0.4517,
-      "volume": 3.87,
-      "aligned": 3
-    }
-  ],
+  "setups": [],
   "sent": {
     "APTUSDT:5m:SHORT:1794751200000": 1794751673
   }

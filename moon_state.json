@@ -1,9 +1,23 @@
 {
   "version": "v7",
-  "lastRun": 1794826399,
+  "lastRun": 1794861830,
   "marketsOK": 15,
   "errors": [],
-  "setups": [],
+  "setups": [
+    {
+      "id": "ARBUSDT:5m:SHORT:1794861300000",
+      "symbol": "ARBUSDT",
+      "side": "SHORT",
+      "score": 78,
+      "entry": 0.13133,
+      "stop": 0.13299,
+      "tp1": 0.12801,
+      "mark": 0.13138,
+      "last": 0.13138,
+      "volume": 3.59,
+      "aligned": 3
+    }
+  ],
   "sent": {
     "APTUSDT:5m:SHORT:1794751200000": 1794751673
   }

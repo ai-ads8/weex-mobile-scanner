@@ -1,33 +1,20 @@
 {
   "version": "v7",
-  "lastRun": 1794885140,
+  "lastRun": 1794916333,
   "marketsOK": 15,
   "errors": [],
   "setups": [
     {
-      "id": "SOLUSDT:5m:LONG:1794884700000",
-      "symbol": "SOLUSDT",
+      "id": "QNTUSDT:5m:LONG:1794915900000",
+      "symbol": "QNTUSDT",
       "side": "LONG",
-      "score": 55,
-      "entry": 72.23,
-      "stop": 71.39,
-      "tp1": 73.91000000000001,
-      "mark": 72.14,
-      "last": 72.15,
-      "volume": 1.72,
-      "aligned": 2
-    },
-    {
-      "id": "INJUSDT:5m:LONG:1794884700000",
-      "symbol": "INJUSDT",
-      "side": "LONG",
-      "score": 55,
-      "entry": 7.202,
-      "stop": 6.889,
-      "tp1": 7.827999999999999,
-      "mark": 7.174,
-      "last": 7.177,
-      "volume": 4.11,
+      "score": 40,
+      "entry": 156.6,
+      "stop": 152.79,
+      "tp1": 164.22,
+      "mark": 156.23,
+      "last": 156.23,
+      "volume": 1.15,
       "aligned": 2
     }
   ],

@@ -1,21 +1,34 @@
 {
   "version": "v7",
-  "lastRun": 1794861830,
+  "lastRun": 1794885140,
   "marketsOK": 15,
   "errors": [],
   "setups": [
     {
-      "id": "ARBUSDT:5m:SHORT:1794861300000",
-      "symbol": "ARBUSDT",
-      "side": "SHORT",
-      "score": 78,
-      "entry": 0.13133,
-      "stop": 0.13299,
-      "tp1": 0.12801,
-      "mark": 0.13138,
-      "last": 0.13138,
-      "volume": 3.59,
-      "aligned": 3
+      "id": "SOLUSDT:5m:LONG:1794884700000",
+      "symbol": "SOLUSDT",
+      "side": "LONG",
+      "score": 55,
+      "entry": 72.23,
+      "stop": 71.39,
+      "tp1": 73.91000000000001,
+      "mark": 72.14,
+      "last": 72.15,
+      "volume": 1.72,
+      "aligned": 2
+    },
+    {
+      "id": "INJUSDT:5m:LONG:1794884700000",
+      "symbol": "INJUSDT",
+      "side": "LONG",
+      "score": 55,
+      "entry": 7.202,
+      "stop": 6.889,
+      "tp1": 7.827999999999999,
+      "mark": 7.174,
+      "last": 7.177,
+      "volume": 4.11,
+      "aligned": 2
     }
   ],
   "sent": {

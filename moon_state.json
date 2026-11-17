@@ -1,23 +1,9 @@
 {
   "version": "v7",
-  "lastRun": 1794916333,
+  "lastRun": 1794945967,
   "marketsOK": 15,
   "errors": [],
-  "setups": [
-    {
-      "id": "QNTUSDT:5m:LONG:1794915900000",
-      "symbol": "QNTUSDT",
-      "side": "LONG",
-      "score": 40,
-      "entry": 156.6,
-      "stop": 152.79,
-      "tp1": 164.22,
-      "mark": 156.23,
-      "last": 156.23,
-      "volume": 1.15,
-      "aligned": 2
-    }
-  ],
+  "setups": [],
   "sent": {
     "APTUSDT:5m:SHORT:1794751200000": 1794751673
   }

@@ -1,10 +1,8 @@
 {
   "version": "v7",
-  "lastRun": 1795341176,
+  "lastRun": 1795368470,
   "marketsOK": 15,
   "errors": [],
   "setups": [],
-  "sent": {
-    "APTUSDT:5m:SHORT:1794751200000": 1794751673
-  }
+  "sent": {}
 }
